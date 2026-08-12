@@ -20,19 +20,21 @@ Mapping (see ``notes/autellix_scheduling/POLICY_REFERENCE.md`` §3-5):
   ``(priority, arrival_time, request_id)``, and the base scheduler's reactive
   KV-pressure victim ``max(running, key=(priority, arrival_time))`` is already
   the worst (most-demoted) running call.
-* Service is proxied by decode steps: each scheduled decode step adds one unit
-  (D4). No cumulative :class:`AttainedServiceTracker` is needed here because the
-  per-call service window is the anti-starvation ``T`` and is reset on promotion.
+* Service is engine wall time (D2): each scheduled step charges its measured
+  duration to every co-scheduled call, prefill chunks included. No cumulative
+  :class:`AttainedServiceTracker` is needed here because the per-call service
+  window is the anti-starvation ``T`` and is reset on promotion.
 * All state is strictly **per call** (there is no process table); the
   anti-starvation ratio uses the call-level windows alone (``W_c / max(1,
   T_c)``), the paper's deliberately "naive" FastServe variant -- the mixin's
   ``_program_windows`` default of ``(0, 0)``. State is released on both normal
   completion and external abort so nothing leaks.
 
-Constants (POLICY_REFERENCE.md §4, decision D5): ``K = 7`` queues, per-queue
-decode-step quanta ``(1, 2, 4, 8, 16, 32, 64)`` (the paper's cited FastServe
-geometric ×2 scheme), and anti-starvation ratio ``beta = 8.0``. They are exposed
-as constructor parameters so a ``beta`` / ``K`` ablation is possible.
+Constants: ``K = 7`` queues, per-queue quanta in seconds of service
+``(1, 2, 4, 8, 16, 32, 64)`` (the paper's cited FastServe geometric ×2 scheme,
+now wall-time so it matches PLAS/ATLAS through the mixin), and anti-starvation
+ratio ``beta = 8.0``. Magnitudes are calibration (not paper-mandated); they are
+exposed as constructor parameters so a ``beta`` / ``K`` ablation is possible.
 
 Proactive preemption + thrash bound: v1 never preempts a running call to admit a
 higher-priority waiting one (it only preempts reactively on KV OOM), so the
@@ -56,10 +58,13 @@ from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 
-# D5 defaults (POLICY_REFERENCE.md §4): K=7 queues with the paper's cited
-# FastServe geometric ×2 decode-step quanta, and anti-starvation ratio beta=8.0.
+# Defaults: K=7 queues with the paper's cited FastServe geometric x2 scheme,
+# in **seconds** of service (per-queue time quanta doubling from 1 s) so MLFQ
+# shares the same wall-time quantum units as PLAS/ATLAS through the mixin, and
+# beta=8.0. Magnitudes are calibration, not paper-mandated (the paper fixes the
+# MLFQ structure and that beta trades response time against fairness).
 _NUM_QUEUES = 7
-_QUEUE_QUANTA: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64)
+_QUEUE_QUANTA: tuple[float, ...] = (1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0)
 _BETA = 8.0
 
 # Preempt at most one running call per scheduling step (the paper preempts "the
@@ -81,7 +86,7 @@ class MLFQScheduler(QuantumMlfqMixin, AsyncScheduler):
         self,
         *args: Any,
         num_queues: int = _NUM_QUEUES,
-        queue_quanta: Sequence[int] = _QUEUE_QUANTA,
+        queue_quanta: Sequence[float] = _QUEUE_QUANTA,
         beta: float = _BETA,
         max_proactive_preemptions_per_step: int = _MAX_PROACTIVE_PREEMPTIONS_PER_STEP,
         **kwargs: Any,

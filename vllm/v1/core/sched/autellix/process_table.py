@@ -6,7 +6,9 @@ A *program* is one multi-step agentic workflow invocation that issues many LLM
 calls. The scheduler groups calls by ``program_id`` and accumulates the
 program's attained service and critical-path scalars here so that program-aware
 policies (PLAS, ATLAS) and anti-starvation logic can consult a single source of
-truth. The module is pure Python with no vLLM/torch dependency.
+truth. Service / critical-path / wait scalars are in **seconds of engine wall
+time** (D3), folded from each call's measured accrual. The module is pure Python
+with no vLLM/torch dependency.
 """
 
 from dataclasses import dataclass, field

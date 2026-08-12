@@ -30,6 +30,15 @@ but never influences a scheduling decision. With no concurrency (sequential
 calls) every call inherits the full scalar left by its predecessor, the max rule
 always increases, and ATLAS degrades exactly to PLAS's cumulative sum.
 
+Deployment note: because ATLAS is a strict *generalization* of PLAS (the "A" is
+"Adaptive") that reduces to it for single-threaded programs, the paper deploys a
+single adaptive scheduler -- this one -- rather than choosing PLAS vs ATLAS per
+program. There is no runtime detector in the paper (adding one would exceed it):
+ATLAS alone handles both regimes. ``PLASScheduler`` and ``MLFQScheduler`` are
+retained as separate ``--scheduler-cls`` choices only for our ablations that
+isolate the sum rule from the critical-path max rule; the faithful "Autellix"
+baseline is ATLAS.
+
 Mapping to the vLLM v1 engine mirrors PLAS (see its module docstring and
 POLICY_REFERENCE.md §6a): the arrival bin of the critical-path scalar is
 written to ``request.priority`` (an int queue level, 0 = top), and Algorithm
@@ -37,9 +46,9 @@ written to ``request.priority`` (an int queue level, 0 = top), and Algorithm
 demotion one level at a time, program-level anti-starvation promotion at
 ``(W_p + W_c) / max(1, T_p + T_c) >= beta`` with only the call-level windows
 reset, and bounded proactive preemption at a full batch. Attained service is
-proxied by decode steps (one unit per scheduled decode step, §2 D4); on
-completion a call folds its critical path with the max rule and its residual
-wait window into the program's ``W_p``.
+engine wall time (each co-scheduled step charges its measured duration, prefill
+chunks included, D2); on completion a call folds its critical path with the max
+rule and its residual wait window into the program's ``W_p``.
 """
 
 import time
@@ -57,13 +66,15 @@ from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 
-# D5 defaults (POLICY_REFERENCE.md §4): K=7 queues with the boundary set
-# (0, 2, 4, 8, 16, 32, 64, inf) for arrival binning; pass the thresholds
-# explicitly since the geometric default is not the D5 boundary set. The
-# per-queue decode-step quanta and beta follow the FastServe scheme.
+# Defaults: K=7 queues binning the program's critical-path scalar (execution
+# time, seconds) with contiguous boundaries (0, 2, 4, 8, 16, 32, 64, inf). The
+# paper (§4.2) fixes the STRUCTURE -- K queues with Q1_lo=0, QK_hi=inf,
+# Q_{i+1}_lo = Q_i_hi, a per-queue *time* quantum, and the beta wait/service
+# ratio -- but not these magnitudes, so the numbers are calibration, not
+# paper-mandated.
 _NUM_QUEUES = 7
 _THRESHOLDS = [2.0, 4.0, 8.0, 16.0, 32.0, 64.0]
-_QUEUE_QUANTA: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64)
+_QUEUE_QUANTA: tuple[float, ...] = (1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0)
 _BETA = 8.0
 _MAX_PROACTIVE_PREEMPTIONS_PER_STEP = 1
 
@@ -81,8 +92,9 @@ class ATLASScheduler(QuantumMlfqMixin, AsyncScheduler):
     Subclasses ``AsyncScheduler`` (not ``Scheduler``) so vLLM keeps async
     scheduling enabled; the accrual/fold overrides compose with the async
     placeholder bookkeeping exactly as in ``PLASScheduler`` (the max rule folds
-    the same per-call service, which the base async over-schedule guard keeps at
-    one unit per output token), and sync operation is unchanged.
+    the same per-call service, now measured in seconds of engine wall time and
+    robust to async run-ahead and variable batch composition), and sync
+    operation is charged identically.
     """
 
     def __init__(
@@ -90,7 +102,7 @@ class ATLASScheduler(QuantumMlfqMixin, AsyncScheduler):
         *args: Any,
         num_queues: int = _NUM_QUEUES,
         thresholds: Sequence[float] = tuple(_THRESHOLDS),
-        queue_quanta: Sequence[int] = _QUEUE_QUANTA,
+        queue_quanta: Sequence[float] = _QUEUE_QUANTA,
         beta: float = _BETA,
         max_proactive_preemptions_per_step: int = _MAX_PROACTIVE_PREEMPTIONS_PER_STEP,
         **kwargs: Any,
@@ -103,15 +115,15 @@ class ATLASScheduler(QuantumMlfqMixin, AsyncScheduler):
         deploying with only ``--scheduler-cls ...ATLASScheduler`` yields the right
         ordering, and instantiates the policy core (process table,
         attained-service tracker, MLFQ binner + quantum machinery) plus the
-        per-call maps. The constants default to the D5 / FastServe values and
-        are accepted as parameters so a ``beta`` / ``K`` ablation is possible.
+        per-call maps. The seconds-based constants default to the module values
+        and are accepted as parameters so a ``beta`` / ``K`` ablation is possible.
 
         Args:
             num_queues: Number of priority levels ``K``.
-            thresholds: Cumulative service thresholds for arrival binning; must
-                have length ``num_queues - 1``.
-            queue_quanta: Per-level decode-step quantum; must have length
-                ``num_queues``.
+            thresholds: Cumulative critical-path thresholds (seconds) for
+                arrival binning; must have length ``num_queues - 1``.
+            queue_quanta: Per-level quantum in seconds of service; must have
+                length ``num_queues``.
             beta: Anti-starvation wait-to-service ratio threshold.
             max_proactive_preemptions_per_step: Upper bound on proactive
                 preemptions per ``schedule()`` call (0 disables it).
@@ -213,14 +225,19 @@ class ATLASScheduler(QuantumMlfqMixin, AsyncScheduler):
             return (0.0, 0.0)
         return (state.total_wait, state.max_critical_path)
 
-    def _on_service_step(self, req_id: str) -> None:
-        """Accrue one unit of attained service per charged decode step.
+    def _on_service_step(self, req_id: str, amount: float) -> None:
+        """Accrue this step's measured wall time as attained service (seconds).
 
         Called by the mixin's ``_update_after_schedule`` for exactly the steps
-        that also charge quantum (final, non-prefill-chunk steps), so the
-        max-rule fold and the quantum/starvation windows stay in lockstep.
+        that also charge quantum (every co-scheduled step, prefill chunks
+        included), with the same ``amount``, so the max-rule fold and the
+        quantum / starvation windows stay in lockstep.
+
+        Args:
+            req_id: The scheduled request.
+            amount: Seconds of service charged this step.
         """
-        self.attained_service.record_step(req_id)
+        self.attained_service.record_step(req_id, amount)
 
     def _fold_completed_calls(self, req_ids: Iterable[str], now: float) -> None:
         """Fold each finished call's critical path into its program (max rule).

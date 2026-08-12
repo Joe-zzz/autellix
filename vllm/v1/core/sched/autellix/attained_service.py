@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Per-request attained-service accrual for the Autellix policies.
 
-Attained service is the Least-Attained-Service proxy used by the schedulers:
-the number of decode steps a call (request) has been scheduled for, since each
-continuous-batching step takes roughly constant GPU time. This tracker holds the
-live per-request accrual; on completion the call's total is folded into its
-program via the process table. The module is pure Python with no vLLM/torch
-dependency.
+Attained service is the Least-Attained-Service signal used by the schedulers:
+the **seconds of engine wall time** a call (request) has been scheduled for
+(D2/D3) -- each continuous-batching step charges its measured duration, so
+long prefill steps and big batches are priced at their true cost rather than a
+constant per-step unit. This tracker holds the live per-request accrual; on
+completion the call's total is folded into its program via the process table.
+The module is pure Python with no vLLM/torch dependency.
 """
 
 
@@ -15,7 +16,7 @@ class AttainedServiceTracker:
     """Live attained service per in-flight request, keyed by ``request_id``.
 
     Accrual only ever grows: it is deliberately *not* reset on preemption,
-    because steps recomputed after a recompute-based preemption were still
+    because service recomputed after a recompute-based preemption was still
     served GPU time and should count toward the request's attained service.
     """
 
@@ -23,11 +24,11 @@ class AttainedServiceTracker:
         self._service: dict[str, float] = {}
 
     def record_step(self, request_id: str, amount: float = 1.0) -> None:
-        """Accrue one scheduled decode step's worth of service.
+        """Accrue a scheduled step's service (seconds of engine wall time).
 
         Args:
             request_id: The scheduled request.
-            amount: Service to add for this step (defaults to one step).
+            amount: Seconds of service to add for this step.
         """
         self._service[request_id] = self._service.get(request_id, 0.0) + amount
 
