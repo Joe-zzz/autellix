@@ -38,6 +38,7 @@ from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.swap_pool import HostSwapPool, num_host_blocks_for
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -297,6 +298,34 @@ class Scheduler(SchedulerInterface):
         # FIFO of (fence_seq, blocks): blocks become safe to free once
         # processed_step_seq >= fence_seq.
         self.deferred_frees: deque[tuple[int, list[KVCacheBlock]]] = deque()
+
+        # Swap-based preemption (preemption_mode="swap"): park a preempted
+        # request's KV in a pinned host pool instead of recomputing. Derive the
+        # host block count from kv_cache_config identically to the worker
+        # (gpu_model_runner) so both agree on host block ids.
+        self._swap_preemption = self.scheduler_config.preemption_mode == "swap"
+        num_host_blocks = 0
+        if self._swap_preemption:
+            kv_bytes_per_block = sum(
+                g.kv_cache_spec.page_size_bytes
+                for g in kv_cache_config.kv_cache_groups
+            )
+            num_host_blocks = min(
+                num_host_blocks_for(
+                    self.scheduler_config.swap_space_gb, kv_bytes_per_block
+                ),
+                kv_cache_config.num_blocks,
+            )
+            # Swap-out returns GPU blocks to the pool only after this step's d2h
+            # copy retires, which needs the deferred-free fence active each step.
+            self.defer_block_free = True
+        self.swap_pool = HostSwapPool(num_host_blocks)
+        # (gpu_block_id, host_block_id) pairs to emit on this step's output.
+        self._pending_swap_out: list[tuple[int, int]] = []
+        self._pending_swap_in: list[tuple[int, int]] = []
+        # FIFO of (fence_seq, req_id): a swapped-in request's host slots are
+        # released once processed_step_seq >= fence_seq (the swap-in copy retired).
+        self._deferred_swap_frees: deque[tuple[int, str]] = deque()
 
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
@@ -666,6 +695,7 @@ class Scheduler(SchedulerInterface):
 
                 num_external_computed_tokens = 0
                 load_kv_async = False
+                swap_in = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
                 num_uncached_common_prefix_tokens = 0
 
@@ -775,11 +805,31 @@ class Scheduler(SchedulerInterface):
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
+                    # Swap-based preemption: a parked request's KV lives in the
+                    # host pool, not in GPU blocks. Model it as external computed
+                    # tokens (comp=0, ext=parked) so allocate_slots reserves fresh
+                    # GPU blocks; we load host->GPU via the swap-in descriptor and
+                    # decode this same step -- no re-prefill.
+                    if self._swap_preemption and self.swap_pool.is_parked(
+                        request.request_id
+                    ):
+                        swap_in = True
+                        request.num_computed_tokens = 0
+                        num_external_computed_tokens = num_computed_tokens
+
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
 
-                if load_kv_async:
+                if swap_in:
+                    # Restore parked KV (ext) and, budget permitting, decode one
+                    # new token this same step (else a 0-token load-only step and
+                    # decode resumes next step).
+                    num_new_tokens = min(
+                        max(1, request.num_tokens - num_computed_tokens),
+                        token_budget,
+                    )
+                elif load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
                     assert num_external_computed_tokens > 0
                     num_new_tokens = 0
@@ -958,6 +1008,15 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                if swap_in:
+                    # Pair parked host slots with the freshly allocated GPU blocks
+                    # (logical block order) so the worker restores host->GPU before
+                    # attention; release the host slots once this step retires.
+                    gpu_ids = req_to_new_blocks[request_id].get_block_ids()[0]
+                    host_ids = self.swap_pool.get(request_id) or []
+                    n = min(len(host_ids), len(gpu_ids))
+                    self._pending_swap_in.extend(zip(host_ids[:n], gpu_ids[:n]))
+                    self._deferred_swap_frees.append((self.sched_step_seq, request_id))
                 # Only track requests that will still be prefilling after this chunk.
                 if num_computed_tokens + num_new_tokens < request.num_tokens:
                     self._inflight_prefills.add(request)
@@ -1075,6 +1134,13 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
         )
 
+        # Swap-based preemption: attach this step's swap descriptors (accumulated
+        # during preemption / resume above) and reset the buffers for next step.
+        scheduler_output.blocks_to_swap_out = self._pending_swap_out or None
+        scheduler_output.blocks_to_swap_in = self._pending_swap_in or None
+        self._pending_swap_out = []
+        self._pending_swap_in = []
+
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
         # 2. Wrap up all the KV cache load / save ops into an opaque object
@@ -1113,11 +1179,32 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
-        self._free_request_blocks(request)
+        # Swap mode: park the request's KV in the host pool instead of dropping
+        # it, and keep num_computed_tokens so it resumes without re-prefill.
+        # Falls back to recompute when the host pool is full.
+        swapped = False
+        if self._swap_preemption and not self.swap_pool.is_parked(request.request_id):
+            gpu_ids = list(self.kv_cache_manager.get_block_ids(request.request_id)[0])
+            host_ids = (
+                self.swap_pool.alloc(request.request_id, len(gpu_ids))
+                if gpu_ids
+                else None
+            )
+            if host_ids is not None:
+                self._pending_swap_out.extend(zip(gpu_ids, host_ids))
+                # Return the GPU blocks to the pool only after this step's d2h
+                # copy retires: pop bookkeeping now, free at the step fence.
+                blocks = self.kv_cache_manager.pop_blocks_for_free(request)
+                if blocks:
+                    self.deferred_frees.append((self.sched_step_seq, blocks))
+                swapped = True
+        if not swapped:
+            self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
-        request.num_computed_tokens = 0
+        if not swapped:
+            request.num_computed_tokens = 0
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1
@@ -1480,6 +1567,7 @@ class Scheduler(SchedulerInterface):
         if self.defer_block_free and scheduler_output.total_num_scheduled_tokens > 0:
             self.processed_step_seq += 1
             self._drain_deferred_frees()
+            self._drain_deferred_swap_frees()
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -2019,6 +2107,9 @@ class Scheduler(SchedulerInterface):
                 continue
 
             valid_requests.append(request)
+            if self._swap_preemption and self.swap_pool.is_parked(req_id):
+                # Release a parked request's host swap slots on abort.
+                self.swap_pool.free(req_id)
             if request.status == RequestStatus.RUNNING:
                 running_requests_to_remove.add(request)
             else:
@@ -2107,6 +2198,21 @@ class Scheduler(SchedulerInterface):
             _, blocks = self.deferred_frees.popleft()
             # Free in reverse order so that the tail blocks are evicted first.
             self.kv_cache_manager.block_pool.free_blocks(reversed(blocks))
+
+    def _drain_deferred_swap_frees(self):
+        """Release swapped-in requests' host slots once their swap-in retired.
+
+        A request's host KV slots return to the swap pool only after the
+        host->GPU copy of its swap-in step has completed (else a later swap-out
+        could reuse and overwrite them before the load). Fences mirror
+        ``deferred_frees``; entries are appended with non-decreasing fences.
+        """
+        while self._deferred_swap_frees:
+            fence, req_id = self._deferred_swap_frees[0]
+            if fence > self.processed_step_seq:
+                break
+            self._deferred_swap_frees.popleft()
+            self.swap_pool.free(req_id)
 
     def get_num_unfinished_requests(self) -> int:
         if self._pause_state == PauseState.PAUSED_ALL:
