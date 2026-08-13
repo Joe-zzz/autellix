@@ -1003,6 +1003,33 @@ class VllmConfig:
             else:
                 self.scheduler_config.async_scheduling = True
 
+        # Swap-based preemption is research-grade: it supports only a single
+        # decoder-only engine. It still falls back to recompute per-request when
+        # the host swap pool is full, but these structural constraints must hold
+        # at startup (a sharded / encoder-decoder / spec-decode KV layout is not
+        # handled by the single-tier host swap pool).
+        if self.scheduler_config.preemption_mode == "swap":
+            unsupported: list[str] = []
+            if self.parallel_config.tensor_parallel_size > 1:
+                unsupported.append(
+                    f"tensor_parallel_size={self.parallel_config.tensor_parallel_size}"
+                )
+            if self.parallel_config.pipeline_parallel_size > 1:
+                unsupported.append(
+                    "pipeline_parallel_size="
+                    f"{self.parallel_config.pipeline_parallel_size}"
+                )
+            if self.model_config is not None and self.model_config.is_encoder_decoder:
+                unsupported.append("encoder-decoder model")
+            if self.speculative_config is not None:
+                unsupported.append("speculative decoding")
+            if unsupported:
+                raise ValueError(
+                    "preemption_mode='swap' currently supports only a single "
+                    "decoder-only engine; unsupported here: "
+                    f"{', '.join(unsupported)}. Use preemption_mode='recompute'."
+                )
+
         logger.info_once(
             "Asynchronous scheduling is %s.",
             "enabled" if self.scheduler_config.async_scheduling else "disabled",
