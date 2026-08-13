@@ -1183,7 +1183,19 @@ class Scheduler(SchedulerInterface):
         # it, and keep num_computed_tokens so it resumes without re-prefill.
         # Falls back to recompute when the host pool is full.
         swapped = False
-        if self._swap_preemption and not self.swap_pool.is_parked(request.request_id):
+        # Only swap a request whose last forward has retired: its KV is complete
+        # (safe to copy out this step) and its GPU blocks can return to the pool
+        # IMMEDIATELY -- exactly like recompute -- so the preemption actually
+        # frees room for the admission that triggered it. The memory-pressure
+        # loop and the resume path both retry allocate_slots expecting freed
+        # blocks in the pool the same step; deferring the free stalls them.
+        # In-flight preemptions (KV still being written) fall back to recompute.
+        retired = request.last_sched_seq <= self.processed_step_seq
+        if (
+            self._swap_preemption
+            and retired
+            and not self.swap_pool.is_parked(request.request_id)
+        ):
             gpu_ids = list(self.kv_cache_manager.get_block_ids(request.request_id)[0])
             host_ids = (
                 self.swap_pool.alloc(request.request_id, len(gpu_ids))
@@ -1192,11 +1204,10 @@ class Scheduler(SchedulerInterface):
             )
             if host_ids is not None:
                 self._pending_swap_out.extend(zip(gpu_ids, host_ids))
-                # Return the GPU blocks to the pool only after this step's d2h
-                # copy retires: pop bookkeeping now, free at the step fence.
-                blocks = self.kv_cache_manager.pop_blocks_for_free(request)
-                if blocks:
-                    self.deferred_frees.append((self.sched_step_seq, blocks))
+                # Free now: the swap-out d2h copy runs in _update_states (before
+                # block-zeroing and before the forward), so it reads the original
+                # KV even if these blocks are reallocated this same step.
+                self.kv_cache_manager.free(request)
                 swapped = True
         if not swapped:
             self._free_request_blocks(request)

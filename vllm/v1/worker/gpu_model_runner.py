@@ -1184,18 +1184,20 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
 
+        # Swap-based preemption. Ordering matters: swap-OUT must read the
+        # original KV BEFORE those (now-freed, possibly reallocated) blocks are
+        # zeroed or overwritten; then zero freshly allocated blocks; then swap-IN
+        # restores parked KV into them before attention reads it.
+        if scheduler_output.blocks_to_swap_out:
+            self._swap_kv_blocks(scheduler_output.blocks_to_swap_out, "d2h")
+
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
 
-        # Swap-based preemption: restore parked KV (swap-in) *before* attention
-        # reads it, and park preempted KV (swap-out) — the scheduler only emits
-        # swap-out for blocks whose last write has already fenced.
         if scheduler_output.blocks_to_swap_in:
             self._swap_kv_blocks(scheduler_output.blocks_to_swap_in, "h2d")
-        if scheduler_output.blocks_to_swap_out:
-            self._swap_kv_blocks(scheduler_output.blocks_to_swap_out, "d2h")
 
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
