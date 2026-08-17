@@ -7408,9 +7408,12 @@ class GPUModelRunner(
         self.host_kv_caches: dict[str, torch.Tensor] = {}
         # Per-direction copy cost; weighted by block count so the per-block
         # figure extrapolates across context lengths and model sizes.
+        # Window kept small: a silent timer is ambiguous between "feature never
+        # fired" and "fired fewer times than the window", and distinguishing
+        # those is the whole point of the measurement.
         self._swap_timers = {
-            "d2h": PhaseTimer("swap_out_d2h", emit_every=200),
-            "h2d": PhaseTimer("swap_in_h2d", emit_every=200),
+            "d2h": PhaseTimer("swap_out_d2h", emit_every=20),
+            "h2d": PhaseTimer("swap_in_h2d", emit_every=20),
         }
         if self.scheduler_config.preemption_mode == "swap" and kv_caches:
             # Size the host pool from kv_cache_config (not the tensors) so the

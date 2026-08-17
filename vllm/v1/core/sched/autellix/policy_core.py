@@ -124,6 +124,9 @@ class QuantumMlfqMixin:
         self.binner = binner
         self._call_state: dict[str, CallQueueState] = {}
         self.proactive_preemption_count = 0
+        # Every preemption, whichever path triggered it (see _preempt_request).
+        # Cumulative and never reset, so the last emitted line is the run total.
+        self.preemption_count = 0
 
         # Instrumentation. Under async scheduling the policy's Python work
         # overlaps GPU execution, so it costs nothing until it approaches the
@@ -192,6 +195,19 @@ class QuantumMlfqMixin:
                 scheduler_output.preempted_req_ids |= preempted_req_ids
         return scheduler_output
 
+    def _preempt_request(self, request: Request, timestamp: float) -> None:
+        """Count the preemption, then delegate to the base scheduler.
+
+        Both preemption paths funnel through here -- this mixin's proactive
+        policy preemption (:meth:`_proactively_preempt`) and vLLM's own
+        memory-pressure preemption in the base scheduling loop -- so a single
+        counter covers both, and it works identically under
+        ``preemption_mode="recompute"``, where no swap-side instrumentation
+        exists to observe them.
+        """
+        self.preemption_count += 1
+        super()._preempt_request(request, timestamp)  # type: ignore[misc]
+
     def _emit_timing_if_due(self) -> None:
         """Log the policy's share of the step budget once per window.
 
@@ -199,14 +215,22 @@ class QuantumMlfqMixin:
         optimising it buys nothing; approaching one means it has become the
         step's critical path. Both timers are reset together so the ratio always
         compares the same window.
+
+        The preemption counters are cumulative rather than per-window: they are
+        the number the swap-vs-recompute comparison turns on, and reporting a
+        running total means the final line carries the run total regardless of
+        where the window boundaries fell.
         """
         if not self._policy_timer.should_emit():
             return
         logger.info(
-            "autellix_timing policy=%s interval=%s duty=%s",
+            "autellix_timing policy=%s interval=%s duty=%s preempt_total=%d "
+            "preempt_proactive=%d",
             self._policy_timer.summary(),
             self._interval_timer.summary(),
             duty_cycle(self._policy_timer, self._interval_timer),
+            self.preemption_count,
+            self.proactive_preemption_count,
         )
         self._policy_timer.reset()
         self._interval_timer.reset()
