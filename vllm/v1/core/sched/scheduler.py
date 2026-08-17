@@ -304,6 +304,10 @@ class Scheduler(SchedulerInterface):
         # host block count from kv_cache_config identically to the worker
         # (gpu_model_runner) so both agree on host block ids.
         self._swap_preemption = self.scheduler_config.preemption_mode == "swap"
+        # The swap-out path pairs `get_block_ids(...)[0]` (group 0) with the flat
+        # list from `pop_blocks_for_free` (all groups, interleaved), so the index
+        # split into confirmed/tail is only well-defined for a single group.
+        self._swap_single_group = len(kv_cache_config.kv_cache_groups) == 1
         num_host_blocks = 0
         if self._swap_preemption:
             kv_bytes_per_block = sum(
@@ -1183,31 +1187,70 @@ class Scheduler(SchedulerInterface):
         # it, and keep num_computed_tokens so it resumes without re-prefill.
         # Falls back to recompute when the host pool is full.
         swapped = False
-        # Only swap a request whose last forward has retired: its KV is complete
-        # (safe to copy out this step) and its GPU blocks can return to the pool
-        # IMMEDIATELY -- exactly like recompute -- so the preemption actually
-        # frees room for the admission that triggered it. The memory-pressure
-        # loop and the resume path both retry allocate_slots expecting freed
-        # blocks in the pool the same step; deferring the free stalls them.
-        # In-flight preemptions (KV still being written) fall back to recompute.
-        retired = request.last_sched_seq <= self.processed_step_seq
+        # Swap out the request's CONFIRMED KV prefix rather than all-or-nothing.
+        #
+        # The previous gate required the whole request to have retired
+        # (last_sched_seq <= processed_step_seq) and fell back to recompute
+        # otherwise. Under async scheduling that gate is never satisfied for the
+        # preemptions a program-aware policy actually generates: step N+1's
+        # schedule() runs before step N's update_from_output(), so a request
+        # scheduled in step N has last_sched_seq == N while processed_step_seq
+        # is still N-1, and proactive preemption targets exactly those
+        # actively-decoding requests. Measured on beam-search: 26 preemptions
+        # produced fewer than 20 swap-outs, i.e. swap was largely inert.
+        #
+        # The retirement condition is really per-block, not per-request: the
+        # in-flight step writes only the newest token's block, so every block
+        # before it holds final data that is safe both to copy out and to
+        # release immediately. Splitting there keeps the property the
+        # all-or-nothing gate was protecting (the bulk of the memory returns to
+        # the pool this step, so the admission that triggered the preemption is
+        # not stalled) while letting swap fire on in-flight preemptions. Only
+        # the unconfirmed tail block is deferred, and its content is discarded
+        # and recomputed -- at most block_size tokens.
         if (
             self._swap_preemption
-            and retired
+            and self._swap_single_group
             and not self.swap_pool.is_parked(request.request_id)
         ):
+            # num_output_placeholders is the async run-ahead's count of
+            # in-flight, unconfirmed tokens; it is 0 without async scheduling,
+            # which makes this reduce to "everything is confirmed".
+            confirmed_tokens = max(
+                request.num_computed_tokens - request.num_output_placeholders, 0
+            )
             gpu_ids = list(self.kv_cache_manager.get_block_ids(request.request_id)[0])
+            num_confirmed = min(confirmed_tokens // self.block_size, len(gpu_ids))
             host_ids = (
-                self.swap_pool.alloc(request.request_id, len(gpu_ids))
-                if gpu_ids
+                self.swap_pool.alloc(request.request_id, num_confirmed)
+                if num_confirmed
                 else None
             )
             if host_ids is not None:
-                self._pending_swap_out.extend(zip(gpu_ids, host_ids))
-                # Free now: the swap-out d2h copy runs in _update_states (before
-                # block-zeroing and before the forward), so it reads the original
-                # KV even if these blocks are reallocated this same step.
-                self.kv_cache_manager.free(request)
+                self._pending_swap_out.extend(zip(gpu_ids[:num_confirmed], host_ids))
+                # Pop the bookkeeping so the two groups can be released on
+                # different schedules; blocks come back in allocation order, so
+                # the confirmed prefix is exactly blocks[:num_confirmed].
+                blocks = self.kv_cache_manager.pop_blocks_for_free(request)
+                confirmed_blocks = blocks[:num_confirmed]
+                tail_blocks = blocks[num_confirmed:]
+                # Free the confirmed prefix now: its d2h copy runs in
+                # _update_states before block-zeroing and before the forward, so
+                # it reads the original KV even if these blocks are reallocated
+                # this same step. (Freeing this group ahead of the tail inverts
+                # the usual tail-evicted-first order; harmless here, since the
+                # tail's content is being discarded anyway.)
+                if confirmed_blocks:
+                    self.kv_cache_manager.block_pool.free_blocks(
+                        reversed(confirmed_blocks)
+                    )
+                # The tail block may still be written by the in-flight step, so
+                # it must not return to the pool until that step retires.
+                if tail_blocks:
+                    self.deferred_frees.append((self.sched_step_seq, tail_blocks))
+                # Resume restores this prefix as external computed tokens and
+                # recomputes only what follows.
+                request.num_computed_tokens = num_confirmed * self.block_size
                 swapped = True
         if not swapped:
             self._free_request_blocks(request)

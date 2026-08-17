@@ -1023,9 +1023,6 @@ class VllmConfig:
                 unsupported.append("encoder-decoder model")
             if self.speculative_config is not None:
                 unsupported.append("speculative decoding")
-            if self.use_v2_model_runner:
-                # Swap consumption is wired into the v1 GPUModelRunner only.
-                unsupported.append("v2 model runner (VLLM_USE_V2_MODEL_RUNNER)")
             if unsupported:
                 raise ValueError(
                     "preemption_mode='swap' currently supports only a single "
