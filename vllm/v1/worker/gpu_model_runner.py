@@ -156,6 +156,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+from vllm.v1.metrics.phase_timing import PhaseTimer
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
@@ -1124,6 +1125,10 @@ class GPUModelRunner(
             return
         gpu_ids = [g for g, _ in pairs]
         host_ids = [h for _, h in pairs]
+        # The d2h path is a blocking copy (CudaPlatform.swap_out_blocks_to_host
+        # lands in pageable memory), so this timer measures real stall on the
+        # thread that would otherwise be enqueueing the next step's kernels.
+        started = time.perf_counter()
         if direction == "d2h":
             copy_kv_blocks(
                 self._swap_gpu_kv_caches,
@@ -1140,6 +1145,12 @@ class GPUModelRunner(
                 gpu_ids,
                 "h2d",
             )
+        timer = self._swap_timers.get(direction)
+        if timer is not None:
+            timer.record(time.perf_counter() - started, weight=len(pairs))
+            if timer.should_emit():
+                logger.info("swap_timing %s %s", timer.name, timer.summary())
+                timer.reset()
 
     # Note: used for model runner override.
     def _init_device_properties(self) -> None:
@@ -7395,6 +7406,12 @@ class GPUModelRunner(
         # in recompute mode. Guarded to a single decoder-only engine at startup.
         self._swap_gpu_kv_caches: dict[str, torch.Tensor] = {}
         self.host_kv_caches: dict[str, torch.Tensor] = {}
+        # Per-direction copy cost; weighted by block count so the per-block
+        # figure extrapolates across context lengths and model sizes.
+        self._swap_timers = {
+            "d2h": PhaseTimer("swap_out_d2h", emit_every=200),
+            "h2d": PhaseTimer("swap_in_h2d", emit_every=200),
+        }
         if self.scheduler_config.preemption_mode == "swap" and kv_caches:
             # Size the host pool from kv_cache_config (not the tensors) so the
             # worker and the scheduler — which has no tensors — derive an

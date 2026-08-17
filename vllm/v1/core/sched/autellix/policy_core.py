@@ -40,9 +40,17 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from vllm.logger import init_logger
 from vllm.v1.core.sched.autellix.mlfq import MlfqBinner
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.metrics.phase_timing import PhaseTimer, duty_cycle
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
+
+# Steps per instrumentation window. Large enough that the emit cost is
+# negligible against the per-step work it measures.
+_TIMER_WINDOW = 1000
 
 
 @dataclass
@@ -117,6 +125,15 @@ class QuantumMlfqMixin:
         self._call_state: dict[str, CallQueueState] = {}
         self.proactive_preemption_count = 0
 
+        # Instrumentation. Under async scheduling the policy's Python work
+        # overlaps GPU execution, so it costs nothing until it approaches the
+        # step time; ``_policy_timer`` against ``_interval_timer`` reports that
+        # headroom as a duty cycle (see PhaseTimer.duty_cycle). Emitted
+        # together so both windows cover the same steps.
+        self._policy_timer = PhaseTimer("autellix_policy", emit_every=_TIMER_WINDOW)
+        self._interval_timer = PhaseTimer("schedule_interval", emit_every=_TIMER_WINDOW)
+        self._last_schedule_ts: float | None = None
+
     def _register_call_state(self, request: Request, queue_index: int) -> None:
         """Enter a new call at ``queue_index`` with that queue's full quantum."""
         request.priority = queue_index
@@ -157,8 +174,16 @@ class QuantumMlfqMixin:
         requests, so reporting a victim resumed in this same step is safe.
         """
         now = time.monotonic()
+        entered = time.perf_counter()
+        if self._last_schedule_ts is not None:
+            self._interval_timer.record(entered - self._last_schedule_ts)
+        self._last_schedule_ts = entered
+
         self._accrue_wait_and_promote()
         preempted_req_ids = self._proactively_preempt(now)
+        self._policy_timer.record(time.perf_counter() - entered)
+        self._emit_timing_if_due()
+
         scheduler_output = super().schedule(throttle_prefills)  # type: ignore[misc]
         if preempted_req_ids:
             if scheduler_output.preempted_req_ids is None:
@@ -166,6 +191,25 @@ class QuantumMlfqMixin:
             else:
                 scheduler_output.preempted_req_ids |= preempted_req_ids
         return scheduler_output
+
+    def _emit_timing_if_due(self) -> None:
+        """Log the policy's share of the step budget once per window.
+
+        ``duty`` near zero means async scheduling hides the policy entirely and
+        optimising it buys nothing; approaching one means it has become the
+        step's critical path. Both timers are reset together so the ratio always
+        compares the same window.
+        """
+        if not self._policy_timer.should_emit():
+            return
+        logger.info(
+            "autellix_timing policy=%s interval=%s duty=%s",
+            self._policy_timer.summary(),
+            self._interval_timer.summary(),
+            duty_cycle(self._policy_timer, self._interval_timer),
+        )
+        self._policy_timer.reset()
+        self._interval_timer.reset()
 
     def _accrue_wait_and_promote(self) -> None:
         """Accrue wait for waiting calls and promote the starving ones to Q1.
