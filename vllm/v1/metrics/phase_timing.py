@@ -2,15 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Lightweight phase timing for experiment instrumentation.
 
-Two measurements motivated this module, both on the hot path:
+The measurement that motivated this module is the **scheduler duty cycle**,
+on the hot path: under async scheduling the policy's Python work overlaps GPU
+execution, so it is free until it approaches the step time. Timing the policy
+phase against the inter-``schedule()`` interval gives the headroom directly
+(see :func:`duty_cycle`).
 
-- **Swap-out cost.** ``preemption_mode="swap"`` performs a blocking D2H copy per
-  preempted request. Weighting each sample by its block count yields a per-block
-  cost that extrapolates across context lengths and model sizes.
-- **Scheduler duty cycle.** Under async scheduling the policy's Python work
-  overlaps GPU execution, so it is free until it approaches the step time.
-  Timing the policy phase against the inter-``schedule()`` interval gives the
-  headroom directly (see :func:`duty_cycle`).
+Samples carry an optional weight so a timer can report cost per unit of work
+rather than per event -- e.g. per KV block rather than per call -- which is what
+makes a measurement extrapolate across context lengths and model sizes.
 
 Because this instruments the very overhead it measures, it stays cheap: a
 ``perf_counter`` pair and a list append per record, with percentiles computed
@@ -78,8 +78,8 @@ class PhaseTimer:
     def summary(self) -> dict[str, float] | None:
         """Window statistics, or ``None`` if nothing has been recorded.
 
-        ``per_unit_us`` is present only when weighted samples were recorded;
-        for the swap timer it is the per-KV-block copy cost.
+        ``per_unit_us`` is present only when weighted samples were recorded:
+        total time divided by total weight, e.g. cost per KV block.
         """
         if not self._samples:
             return None

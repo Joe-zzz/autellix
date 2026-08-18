@@ -376,9 +376,7 @@ class QuantumMlfqMixin:
         Both preemption paths funnel through here -- this mixin's proactive
         policy preemption (:meth:`_proactively_preempt`) and vLLM's own
         memory-pressure preemption in the base scheduling loop -- so a single
-        counter covers both, and it works identically under
-        ``preemption_mode="recompute"``, where no swap-side instrumentation
-        exists to observe them.
+        counter covers both.
         """
         self.preemption_count += 1
         super()._preempt_request(request, timestamp)  # type: ignore[misc]
@@ -391,10 +389,9 @@ class QuantumMlfqMixin:
         step's critical path. Both timers are reset together so the ratio always
         compares the same window.
 
-        The preemption counters are cumulative rather than per-window: they are
-        the number the swap-vs-recompute comparison turns on, and reporting a
-        running total means the final line carries the run total regardless of
-        where the window boundaries fell.
+        The preemption counters are cumulative rather than per-window, so the
+        final line carries the run total regardless of where the window
+        boundaries happened to fall.
         """
         if not self._policy_timer.should_emit():
             return
