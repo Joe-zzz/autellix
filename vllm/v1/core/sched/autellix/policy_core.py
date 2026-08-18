@@ -73,15 +73,24 @@ _AUTO_QUANTA_ENV = "AUTELLIX_AUTO_QUANTA"
 # small, which over-demotes and degenerates to FCFS without showing up in
 # throughput or latency -- so it stays conservative.
 #
-# The window is sized by what was measured rather than by sample count, which it
-# has in abundance either way. A 30s window was tried when the calibration had to
-# fit inside a 120s warmup, and came out 23-30% below the 60s result on both
-# engines (0.0460 vs 0.0658 on the 8B PRM, 0.3318 vs 0.4290 on the 1B) with
-# 2277-2703 samples -- far more than a quantile needs, so the gap is the tail of
-# the transient rather than noise: the earlier window simply sits on faster
-# calls. With the RAG probe's warmup aligned to the project's standard 180s that
-# constraint is gone, so the window returns to the 60s value that tracked the
-# hand-validated ladders most closely.
+# The window is 60s because that is what tracked the hand-validated ladders most
+# closely (0.4290s vs 0.5s on the 1B, 0.0658s vs 0.1s on the 8B PRM), not because
+# a mechanism was identified. Three windows were measured, and they rule out the
+# obvious explanation:
+#
+#   sampled span   1B gen     8B PRM
+#   60-120s        0.4290     0.0658
+#   60-90s         0.3318     0.0460
+#   90-120s        0.2918     0.0769
+#
+# Were the engines simply converging on a steady state, the later span would read
+# slower on both. Instead they move in opposite directions -- the PRM slows as its
+# queue builds, while the 1B speeds up, most plausibly as prefix-cache hit rate
+# climbs toward the 98-99% seen in these runs. Several things are still evolving
+# at once over this interval, so no narrow window measures both engines well; the
+# wide one wins by averaging across the trends rather than by sitting on a
+# converged state. Sample count is not the constraint: even the 30s windows held
+# 2277-2703 completions where a quantile needs a few hundred.
 _AUTO_QUANTA_SKIP_S = float(os.getenv("AUTELLIX_AUTO_QUANTA_SKIP_S", "60"))
 _AUTO_QUANTA_WINDOW_S = float(os.getenv("AUTELLIX_AUTO_QUANTA_WINDOW_S", "60"))
 # Floor on samples before trusting the quantile, in case an engine is slow enough
