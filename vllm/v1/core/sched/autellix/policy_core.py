@@ -135,6 +135,15 @@ class QuantumMlfqMixin:
         # Every preemption, whichever path triggered it (see _preempt_request).
         # Cumulative and never reset, so the last emitted line is the run total.
         self.preemption_count = 0
+        # MLFQ activity. The queue structure only does work if calls actually
+        # move between levels: if quanta are far larger than a typical call's
+        # service time nothing is ever demoted, and if they are far smaller
+        # everything sinks to the bottom queue immediately -- both degenerate to
+        # FCFS with extra bookkeeping. The paper fixes the structure but states
+        # no numeric quanta, so these counters are how we tell whether the
+        # values we inherited are calibrated for this workload at all.
+        self.demotion_count = 0
+        self.promotion_count = 0
 
         # Instrumentation. Under async scheduling the policy's Python work
         # overlaps GPU execution, so it costs nothing until it approaches the
@@ -255,14 +264,24 @@ class QuantumMlfqMixin:
         """
         if not self._policy_timer.should_emit():
             return
+        # Snapshot of where live calls currently sit, alongside the cumulative
+        # movement counters. A histogram concentrated in one level means the
+        # MLFQ has collapsed to FCFS; a spread means the quanta are doing work.
+        occupancy = [0] * self.num_queues
+        for state in self._call_state.values():
+            if 0 <= state.queue_index < self.num_queues:
+                occupancy[state.queue_index] += 1
         logger.info(
             "autellix_timing policy=%s interval=%s duty=%s preempt_total=%d "
-            "preempt_proactive=%d",
+            "preempt_proactive=%d demotions=%d promotions=%d queue_occupancy=%s",
             self._policy_timer.summary(),
             self._interval_timer.summary(),
             duty_cycle(self._policy_timer, self._interval_timer),
             self.preemption_count,
             self.proactive_preemption_count,
+            self.demotion_count,
+            self.promotion_count,
+            occupancy,
         )
         self._policy_timer.reset()
         self._interval_timer.reset()
@@ -307,6 +326,7 @@ class QuantumMlfqMixin:
         untouched (paper §4.2.2): resetting them would immediately re-starve
         the program's other calls.
         """
+        self.promotion_count += 1
         state.queue_index = 0
         state.quantum_remaining = self.queue_quanta[0]
         state.wait_window = 0.0
@@ -378,6 +398,7 @@ class QuantumMlfqMixin:
             state.service_window += step_dt
             self._on_service_step(req_id, step_dt)
             if state.quantum_remaining <= 0.0:
+                self.demotion_count += 1
                 state.queue_index = self.binner.demote(state.queue_index)
                 request.priority = state.queue_index
                 state.quantum_remaining = self.queue_quanta[state.queue_index]
