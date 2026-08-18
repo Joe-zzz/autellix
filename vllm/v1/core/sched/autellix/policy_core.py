@@ -57,6 +57,20 @@ logger = init_logger(__name__)
 _TIMER_WINDOW = 1000
 
 _QUANTA_ENV = "AUTELLIX_QUEUE_QUANTA"
+_AUTO_QUANTA_ENV = "AUTELLIX_AUTO_QUANTA"
+# Completed calls to observe before calibrating. Small because the distributions
+# are tight and high-volume: a 20-minute beam-search run completed 124025 calls
+# on one engine, so this fills within seconds of load starting, well inside the
+# warmup window that precedes measurement.
+_AUTO_QUANTA_SAMPLES = 500
+# Q1 lands at this quantile of observed call service, and the ladder doubles from
+# there. Calibrated by hand first: the engines' typical calls measured ~0.3 s
+# (8B PRM), ~2 s (1B generation) and ~16-32 s (RAG), and ladders starting near a
+# quarter of those put every engine into a healthy spread, where both a ladder
+# 3x too high (zero demotions, MLFQ inert) and one 20x too low (calls sink to the
+# bottom level immediately) had failed.
+_AUTO_QUANTA_QUANTILE = 0.25
+_MIN_QUANTUM_S = 1e-3
 
 
 def quanta_from_env(default: tuple[float, ...]) -> tuple[float, ...]:
@@ -208,6 +222,17 @@ class QuantumMlfqMixin:
         # queue. Either way the fix is a ladder scaled to this distribution.
         self._service_ladder = tuple(self.queue_quanta)
         self.completed_service_hist = [0] * (len(self._service_ladder) + 1)
+
+        # Auto-calibration. Opt-in, so runs that do not ask for it keep the
+        # ladder they were configured with and stay comparable to earlier
+        # results. Calibrating once and then freezing -- rather than tracking
+        # continuously -- keeps the measurement phase deterministic and avoids
+        # the feedback loop a continuous controller would have, since quanta
+        # affect scheduling, which affects service times, which would feed back
+        # into the quanta.
+        self._auto_quanta = os.getenv(_AUTO_QUANTA_ENV, "").strip() not in ("", "0")
+        self._auto_samples: list[float] = []
+        self._auto_calibrated = False
 
         # Instrumentation. Under async scheduling the policy's Python work
         # overlaps GPU execution, so it costs nothing until it approaches the
@@ -480,11 +505,47 @@ class QuantumMlfqMixin:
         """
         if state is None:
             return
+        self._maybe_calibrate_quanta(state.total_service)
         for i, bound in enumerate(self._service_ladder):
             if state.total_service < bound:
                 self.completed_service_hist[i] += 1
                 return
         self.completed_service_hist[-1] += 1
+
+    def _maybe_calibrate_quanta(self, total_service: float) -> None:
+        """Collect one sample and, once there are enough, fix the ladder.
+
+        Runs only under ``AUTELLIX_AUTO_QUANTA``. Samples accumulate until
+        ``_AUTO_QUANTA_SAMPLES`` calls have completed, at which point Q1 is set
+        to the ``_AUTO_QUANTA_QUANTILE`` quantile of what was observed and the
+        rest of the ladder doubles from there; calibration then stops for the
+        life of the engine.
+
+        Calls already in flight keep the quantum they were issued, so the switch
+        cannot retroactively demote anything; only calls registered afterwards
+        see the new ladder.
+        """
+        if not self._auto_quanta or self._auto_calibrated:
+            return
+        self._auto_samples.append(total_service)
+        if len(self._auto_samples) < _AUTO_QUANTA_SAMPLES:
+            return
+
+        ordered = sorted(self._auto_samples)
+        idx = min(int(_AUTO_QUANTA_QUANTILE * len(ordered)), len(ordered) - 1)
+        base = max(ordered[idx], _MIN_QUANTUM_S)
+        self.queue_quanta = tuple(base * (2**i) for i in range(self.num_queues))
+        self._service_ladder = tuple(self.queue_quanta)
+        self.completed_service_hist = [0] * (len(self._service_ladder) + 1)
+        self._auto_calibrated = True
+        self._auto_samples.clear()
+        logger.info(
+            "autellix_auto_quanta calibrated: p%d=%.4fs over %d calls -> ladder=%s",
+            int(_AUTO_QUANTA_QUANTILE * 100),
+            base,
+            _AUTO_QUANTA_SAMPLES,
+            [round(q, 4) for q in self.queue_quanta],
+        )
 
     def _release_call_state(self, req_ids: Iterable[str]) -> None:
         """Drop each finished call's per-call state.
