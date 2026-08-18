@@ -58,11 +58,18 @@ _TIMER_WINDOW = 1000
 
 _QUANTA_ENV = "AUTELLIX_QUEUE_QUANTA"
 _AUTO_QUANTA_ENV = "AUTELLIX_AUTO_QUANTA"
-# Completed calls to observe before calibrating. Small because the distributions
-# are tight and high-volume: a 20-minute beam-search run completed 124025 calls
-# on one engine, so this fills within seconds of load starting, well inside the
-# warmup window that precedes measurement.
-_AUTO_QUANTA_SAMPLES = 500
+# Calibration samples over a TIME window rather than a fixed count. A count-based
+# window is self-defeating on a fast engine: 500 samples filled within seconds of
+# load starting on the 8B PRM and produced p25=0.017s, six times below the 0.1s
+# that was validated by hand, because it captured only the startup transient --
+# small batches, no queueing, calls running unrepresentatively fast. A time
+# window is also self-scaling across engines: a fast one contributes many samples
+# and a slow one few, but both describe the same interval of real load.
+_AUTO_QUANTA_SKIP_S = 60.0
+_AUTO_QUANTA_WINDOW_S = 60.0
+# Floor on samples before trusting the quantile, in case an engine is slow enough
+# that the window yields very few completions.
+_AUTO_QUANTA_MIN_SAMPLES = 50
 # Q1 lands at this quantile of observed call service, and the ladder doubles from
 # there. Calibrated by hand first: the engines' typical calls measured ~0.3 s
 # (8B PRM), ~2 s (1B generation) and ~16-32 s (RAG), and ladders starting near a
@@ -233,6 +240,10 @@ class QuantumMlfqMixin:
         self._auto_quanta = os.getenv(_AUTO_QUANTA_ENV, "").strip() not in ("", "0")
         self._auto_samples: list[float] = []
         self._auto_calibrated = False
+        # Set on the first completion, so the window is measured from when load
+        # actually starts rather than from engine construction, which precedes
+        # model loading and graph capture by minutes.
+        self._auto_first_completion_ts: float | None = None
 
         # Instrumentation. Under async scheduling the policy's Python work
         # overlaps GPU execution, so it costs nothing until it approaches the
@@ -515,11 +526,14 @@ class QuantumMlfqMixin:
     def _maybe_calibrate_quanta(self, total_service: float) -> None:
         """Collect one sample and, once there are enough, fix the ladder.
 
-        Runs only under ``AUTELLIX_AUTO_QUANTA``. Samples accumulate until
-        ``_AUTO_QUANTA_SAMPLES`` calls have completed, at which point Q1 is set
-        to the ``_AUTO_QUANTA_QUANTILE`` quantile of what was observed and the
-        rest of the ladder doubles from there; calibration then stops for the
-        life of the engine.
+        Runs only under ``AUTELLIX_AUTO_QUANTA``. The first
+        ``_AUTO_QUANTA_SKIP_S`` seconds of completions are discarded as startup
+        transient, the next ``_AUTO_QUANTA_WINDOW_S`` seconds are sampled, and Q1
+        is then set to the ``_AUTO_QUANTA_QUANTILE`` quantile of that window with
+        the rest of the ladder doubling from there; calibration then stops for
+        the life of the engine. If the window yields fewer than
+        ``_AUTO_QUANTA_MIN_SAMPLES`` completions the configured ladder is kept
+        rather than fitted to noise.
 
         Calls already in flight keep the quantum they were issued, so the switch
         cannot retroactively demote anything; only calls registered afterwards
@@ -527,8 +541,26 @@ class QuantumMlfqMixin:
         """
         if not self._auto_quanta or self._auto_calibrated:
             return
+        now = self._clock()
+        if self._auto_first_completion_ts is None:
+            self._auto_first_completion_ts = now
+            return
+        elapsed = now - self._auto_first_completion_ts
+        if elapsed < _AUTO_QUANTA_SKIP_S:
+            return
         self._auto_samples.append(total_service)
-        if len(self._auto_samples) < _AUTO_QUANTA_SAMPLES:
+        if elapsed < _AUTO_QUANTA_SKIP_S + _AUTO_QUANTA_WINDOW_S:
+            return
+        if len(self._auto_samples) < _AUTO_QUANTA_MIN_SAMPLES:
+            # Too few completions to trust a quantile; keep the configured
+            # ladder rather than calibrating onto noise.
+            self._auto_calibrated = True
+            logger.info(
+                "autellix_auto_quanta skipped: only %d samples in %.0fs window",
+                len(self._auto_samples),
+                _AUTO_QUANTA_WINDOW_S,
+            )
+            self._auto_samples.clear()
             return
 
         ordered = sorted(self._auto_samples)
@@ -540,10 +572,13 @@ class QuantumMlfqMixin:
         self._auto_calibrated = True
         self._auto_samples.clear()
         logger.info(
-            "autellix_auto_quanta calibrated: p%d=%.4fs over %d calls -> ladder=%s",
+            "autellix_auto_quanta calibrated: p%d=%.4fs over %d calls in a "
+            "%.0fs window (after %.0fs skip) -> ladder=%s",
             int(_AUTO_QUANTA_QUANTILE * 100),
             base,
-            _AUTO_QUANTA_SAMPLES,
+            len(ordered),
+            _AUTO_QUANTA_WINDOW_S,
+            _AUTO_QUANTA_SKIP_S,
             [round(q, 4) for q in self.queue_quanta],
         )
 
