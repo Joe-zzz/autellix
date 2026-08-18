@@ -262,6 +262,7 @@ class ATLASScheduler(QuantumMlfqMixin, AsyncScheduler):
             call_service = self.attained_service.pop(req_id)
             start_scalar = self._req_to_start_scalar.pop(req_id, 0.0)
             call_state = self._call_state.pop(req_id, None)
+            self.record_completed_call(call_state)
             self._req_to_thread_id.pop(req_id, None)
             if program_id is None:
                 continue

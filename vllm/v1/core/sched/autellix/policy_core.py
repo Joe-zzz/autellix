@@ -80,6 +80,9 @@ class CallQueueState:
     quantum_remaining: float
     wait_window: float
     service_window: float
+    # Lifetime service, unlike service_window which anti-starvation promotion
+    # resets. Used only to histogram completed calls against the quantum ladder.
+    total_service: float = 0.0
 
 
 class QuantumMlfqMixin:
@@ -144,6 +147,15 @@ class QuantumMlfqMixin:
         # values we inherited are calibrated for this workload at all.
         self.demotion_count = 0
         self.promotion_count = 0
+        # Completed calls bucketed against the quantum ladder, to answer what
+        # the quanta should be rather than guessing. Bucket i counts calls whose
+        # total service fell in [ladder[i-1], ladder[i]); the last bucket is the
+        # overflow past the final quantum. If nearly everything lands in bucket
+        # 0 the ladder sits above the workload and the MLFQ is inert; if nearly
+        # everything overflows it sits below and every call sinks to the bottom
+        # queue. Either way the fix is a ladder scaled to this distribution.
+        self._service_ladder = tuple(self.queue_quanta)
+        self.completed_service_hist = [0] * (len(self._service_ladder) + 1)
 
         # Instrumentation. Under async scheduling the policy's Python work
         # overlaps GPU execution, so it costs nothing until it approaches the
@@ -273,7 +285,8 @@ class QuantumMlfqMixin:
                 occupancy[state.queue_index] += 1
         logger.info(
             "autellix_timing policy=%s interval=%s duty=%s preempt_total=%d "
-            "preempt_proactive=%d demotions=%d promotions=%d queue_occupancy=%s",
+            "preempt_proactive=%d demotions=%d promotions=%d queue_occupancy=%s "
+            "call_service_hist=%s ladder=%s",
             self._policy_timer.summary(),
             self._interval_timer.summary(),
             duty_cycle(self._policy_timer, self._interval_timer),
@@ -282,6 +295,8 @@ class QuantumMlfqMixin:
             self.demotion_count,
             self.promotion_count,
             occupancy,
+            self.completed_service_hist,
+            list(self._service_ladder),
         )
         self._policy_timer.reset()
         self._interval_timer.reset()
@@ -396,12 +411,28 @@ class QuantumMlfqMixin:
             state = self._call_state[req_id]
             state.quantum_remaining -= step_dt
             state.service_window += step_dt
+            state.total_service += step_dt
             self._on_service_step(req_id, step_dt)
             if state.quantum_remaining <= 0.0:
                 self.demotion_count += 1
                 state.queue_index = self.binner.demote(state.queue_index)
                 request.priority = state.queue_index
                 state.quantum_remaining = self.queue_quanta[state.queue_index]
+
+    def record_completed_call(self, state: CallQueueState | None) -> None:
+        """Bucket a finished call's lifetime service against the quantum ladder.
+
+        Called from every completion path: :meth:`_release_call_state` for the
+        MLFQ baseline, and the program-aware schedulers' ``_fold_completed_calls``,
+        which pop ``_call_state`` themselves.
+        """
+        if state is None:
+            return
+        for i, bound in enumerate(self._service_ladder):
+            if state.total_service < bound:
+                self.completed_service_hist[i] += 1
+                return
+        self.completed_service_hist[-1] += 1
 
     def _release_call_state(self, req_ids: Iterable[str]) -> None:
         """Drop each finished call's per-call state.
@@ -412,4 +443,4 @@ class QuantumMlfqMixin:
         id.
         """
         for req_id in req_ids:
-            self._call_state.pop(req_id, None)
+            self.record_completed_call(self._call_state.pop(req_id, None))

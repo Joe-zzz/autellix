@@ -215,6 +215,7 @@ class PLASScheduler(QuantumMlfqMixin, AsyncScheduler):
             program_id = self._req_to_pid.pop(req_id, None)
             service = self.attained_service.pop(req_id)
             call_state = self._call_state.pop(req_id, None)
+            self.record_completed_call(call_state)
             if program_id is None:
                 continue
             self.process_table.add_service(program_id, service)
