@@ -65,8 +65,19 @@ _AUTO_QUANTA_ENV = "AUTELLIX_AUTO_QUANTA"
 # small batches, no queueing, calls running unrepresentatively fast. A time
 # window is also self-scaling across engines: a fast one contributes many samples
 # and a slow one few, but both describe the same interval of real load.
-_AUTO_QUANTA_SKIP_S = 60.0
-_AUTO_QUANTA_WINDOW_S = 60.0
+# The two halves are constrained by different things, so they are sized
+# differently. The skip must outlast the startup transient, whose duration is not
+# known: at ~6s in the transient was still strong (p25=0.017s against a
+# steady-state 0.066s) and 60s was clean, with nothing measured in between. Its
+# failure mode is also silent -- calibrating onto the transient yields quanta too
+# small, which over-demotes and degenerates to FCFS without showing up in
+# throughput or latency -- so it stays conservative. The window only has to
+# collect enough samples for a quantile, and is heavily over-provisioned at 60s:
+# the 8B PRM completes ~4681 calls per 60s, where a few hundred suffice. Halving
+# it costs no precision and keeps the total inside the shortest warmup that
+# precedes measurement.
+_AUTO_QUANTA_SKIP_S = float(os.getenv("AUTELLIX_AUTO_QUANTA_SKIP_S", "60"))
+_AUTO_QUANTA_WINDOW_S = float(os.getenv("AUTELLIX_AUTO_QUANTA_WINDOW_S", "30"))
 # Floor on samples before trusting the quantile, in case an engine is slow enough
 # that the window yields very few completions.
 _AUTO_QUANTA_MIN_SAMPLES = 50
