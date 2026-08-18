@@ -71,13 +71,19 @@ _AUTO_QUANTA_ENV = "AUTELLIX_AUTO_QUANTA"
 # steady-state 0.066s) and 60s was clean, with nothing measured in between. Its
 # failure mode is also silent -- calibrating onto the transient yields quanta too
 # small, which over-demotes and degenerates to FCFS without showing up in
-# throughput or latency -- so it stays conservative. The window only has to
-# collect enough samples for a quantile, and is heavily over-provisioned at 60s:
-# the 8B PRM completes ~4681 calls per 60s, where a few hundred suffice. Halving
-# it costs no precision and keeps the total inside the shortest warmup that
-# precedes measurement.
+# throughput or latency -- so it stays conservative.
+#
+# The window is sized by what was measured rather than by sample count, which it
+# has in abundance either way. A 30s window was tried when the calibration had to
+# fit inside a 120s warmup, and came out 23-30% below the 60s result on both
+# engines (0.0460 vs 0.0658 on the 8B PRM, 0.3318 vs 0.4290 on the 1B) with
+# 2277-2703 samples -- far more than a quantile needs, so the gap is the tail of
+# the transient rather than noise: the earlier window simply sits on faster
+# calls. With the RAG probe's warmup aligned to the project's standard 180s that
+# constraint is gone, so the window returns to the 60s value that tracked the
+# hand-validated ladders most closely.
 _AUTO_QUANTA_SKIP_S = float(os.getenv("AUTELLIX_AUTO_QUANTA_SKIP_S", "60"))
-_AUTO_QUANTA_WINDOW_S = float(os.getenv("AUTELLIX_AUTO_QUANTA_WINDOW_S", "30"))
+_AUTO_QUANTA_WINDOW_S = float(os.getenv("AUTELLIX_AUTO_QUANTA_WINDOW_S", "60"))
 # Floor on samples before trusting the quantile, in case an engine is slow enough
 # that the window yields very few completions.
 _AUTO_QUANTA_MIN_SAMPLES = 50
