@@ -51,7 +51,7 @@ from typing import Any
 
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.autellix.mlfq import MlfqBinner
-from vllm.v1.core.sched.autellix.policy_core import QuantumMlfqMixin
+from vllm.v1.core.sched.autellix.policy_core import QuantumMlfqMixin, quanta_from_env
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.engine import EngineCoreOutputs
@@ -130,7 +130,7 @@ class MLFQScheduler(QuantumMlfqMixin, AsyncScheduler):
         # irrelevant here.
         self._init_policy_core(
             num_queues=num_queues,
-            queue_quanta=tuple(queue_quanta),
+            queue_quanta=quanta_from_env(tuple(queue_quanta)),
             beta=beta,
             max_proactive_preemptions_per_step=max_proactive_preemptions_per_step,
             binner=MlfqBinner(num_queues=num_queues),

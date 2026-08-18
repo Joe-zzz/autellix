@@ -39,6 +39,7 @@ release. It relies on base-scheduler attributes (``waiting``,
 ``_preempt_request``) and must precede ``AsyncScheduler`` in the MRO.
 """
 
+import os
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -54,6 +55,57 @@ logger = init_logger(__name__)
 # Steps per instrumentation window. Large enough that the emit cost is
 # negligible against the per-step work it measures.
 _TIMER_WINDOW = 1000
+
+_QUANTA_ENV = "AUTELLIX_QUEUE_QUANTA"
+
+
+def quanta_from_env(default: tuple[float, ...]) -> tuple[float, ...]:
+    """Read the per-queue quantum ladder from the environment, else ``default``.
+
+    The ladder has to be scaled to the workload: measured on beam-search, the 1B
+    generation engine put 84287 of 155425 completed calls under the first
+    1-second quantum while the 8B PRM put *all* 124025 of its calls there and was
+    never demoted, leaving PLAS, MLFQ and FCFS equivalent on that engine. RAG's
+    generation model sits at the other extreme, with its first two levels empty.
+    One ladder cannot serve all three, and the paper fixes the MLFQ structure
+    without stating any numeric quanta, so these are calibration rather than
+    fidelity.
+
+    An environment variable rather than a CLI flag because vLLM instantiates the
+    scheduler with a fixed kwargs set (``v1/engine/core.py:150``) and offers no
+    way to pass constructor arguments through ``--scheduler-cls``. Per-model
+    values are then reachable via ``ModelConfig.with_env``.
+
+    Args:
+        default: Ladder to use when the variable is unset or empty.
+
+    Returns:
+        The parsed ladder, or ``default``.
+
+    Raises:
+        ValueError: If the variable is set but not a comma-separated list of
+            positive, strictly increasing floats of the same length as
+            ``default`` -- failing loudly beats silently scheduling on a ladder
+            the caller did not intend.
+    """
+    raw = os.getenv(_QUANTA_ENV, "").strip()
+    if not raw:
+        return default
+    try:
+        values = tuple(float(x) for x in raw.split(","))
+    except ValueError as exc:
+        raise ValueError(
+            f"{_QUANTA_ENV}={raw!r} is not a comma-separated float list"
+        ) from exc
+    if len(values) != len(default):
+        raise ValueError(
+            f"{_QUANTA_ENV} must have {len(default)} entries, got {len(values)}"
+        )
+    if any(v <= 0 for v in values):
+        raise ValueError(f"{_QUANTA_ENV} entries must be positive, got {values}")
+    if any(b <= a for a, b in zip(values, values[1:])):
+        raise ValueError(f"{_QUANTA_ENV} must be strictly increasing, got {values}")
+    return values
 
 
 @dataclass
