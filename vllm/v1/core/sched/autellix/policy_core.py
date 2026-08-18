@@ -39,6 +39,7 @@ release. It relies on base-scheduler attributes (``waiting``,
 ``_preempt_request``) and must precede ``AsyncScheduler`` in the MRO.
 """
 
+import inspect
 import os
 import time
 from collections.abc import Callable, Iterable
@@ -354,7 +355,14 @@ class QuantumMlfqMixin:
         self._policy_timer.record(time.perf_counter() - entered)
         self._emit_timing_if_due()
 
-        scheduler_output = super().schedule(throttle_prefills)  # type: ignore[misc]
+        # `throttle_prefills` is a v0.24 parameter (data-parallel prefill
+        # throttling); v0.17's `schedule()` takes none. Probing the signature
+        # keeps one mixin working against both base schedulers.
+        base_schedule = super().schedule  # type: ignore[misc]
+        if "throttle_prefills" in inspect.signature(base_schedule).parameters:
+            scheduler_output = base_schedule(throttle_prefills)
+        else:
+            scheduler_output = base_schedule()
         if preempted_req_ids:
             if scheduler_output.preempted_req_ids is None:
                 scheduler_output.preempted_req_ids = preempted_req_ids
@@ -425,6 +433,11 @@ class QuantumMlfqMixin:
         its call-level windows reset, and the queue is re-heapified so the base
         loop sees the new ordering.
         """
+        # The schedulers always construct `skipped_waiting`, but only a v0.24
+        # base loop parks calls there across steps; v0.17's is a step-local
+        # queue drained back into `self.waiting` before `schedule()` returns
+        # (`sched/scheduler.py:815`). So on v0.17 this iterates an always-empty
+        # queue and `waiting` alone is already the complete waiting population.
         for queue in (self.waiting, self.skipped_waiting):
             promoted: list[Request] = []
             for request in list(queue):
