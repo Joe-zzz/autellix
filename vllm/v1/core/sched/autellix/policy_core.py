@@ -106,6 +106,24 @@ _AUTO_QUANTA_MIN_SAMPLES = 50
 _AUTO_QUANTA_QUANTILE = 0.25
 _MIN_QUANTUM_S = 1e-3
 
+# Alternative Q1 anchor: the minimum observed schedule() step duration in the
+# calibration window, instead of a quantile of completed-call service. This is
+# the FastServe paper's own rule (arXiv:2305.05920: "the quantum of the highest
+# priority queue is set to the minimum iteration time") -- the finest unit the
+# scheduler can even act at, since a call cannot be demoted before completing
+# one charged step. p25-of-call-service, by contrast, can let the shortest
+# quarter of calls run their ENTIRE multi-step service at top priority before
+# the ladder differentiates them at all, which is looser than the paper's own
+# design. Kept opt-in and separate from the default quantile anchor: literally
+# reusing this run's 7-level, 2x-growth ladder shape with a millisecond-scale
+# Q1 very plausibly reproduces the Pass-2 bottom-queue collapse (a ladder ~20x
+# too low relative to the validated one already did) for workloads whose calls
+# run into the tens of seconds, since 7 doublings from ~10-20 ms only reaches
+# roughly a second. Untested until measured -- this flag exists to measure it,
+# not because the outcome is assumed either way.
+_AUTO_QUANTA_ANCHOR_ENV = "AUTELLIX_AUTO_QUANTA_ANCHOR"
+_AUTO_QUANTA_ANCHOR_MIN_STEP = "min_step"
+
 
 def quanta_from_env(default: tuple[float, ...]) -> tuple[float, ...]:
     """Read the per-queue quantum ladder from the environment, else ``default``.
@@ -271,6 +289,11 @@ class QuantumMlfqMixin:
         # actually starts rather than from engine construction, which precedes
         # model loading and graph capture by minutes.
         self._auto_first_completion_ts: float | None = None
+        # Alternative anchor (see _AUTO_QUANTA_ANCHOR_ENV above). Tracked over
+        # the SAME skip+window as the default quantile anchor, so a comparison
+        # between the two isolates the anchor choice alone.
+        self._auto_anchor = os.getenv(_AUTO_QUANTA_ANCHOR_ENV, "").strip().lower()
+        self._auto_min_step_dt: float | None = None
 
         # Instrumentation. Under async scheduling the policy's Python work
         # overlaps GPU execution, so it costs nothing until it approaches the
@@ -350,6 +373,25 @@ class QuantumMlfqMixin:
         else:
             self._step_dt = min(max(now - self._last_step_ts, 0.0), self._max_step_dt)
         self._last_step_ts = now
+        if (
+            self._auto_anchor == _AUTO_QUANTA_ANCHOR_MIN_STEP
+            and not self._auto_calibrated
+            and self._auto_first_completion_ts is not None
+            and self._step_dt > 0.0
+        ):
+            # Bounded to the SAME skip+window as the quantile sampler (not just
+            # "after the skip"), so the two anchors are measured over identical
+            # wall-clock spans and a comparison isolates the anchor choice
+            # alone. A step with nothing running yet reads as 0.0 (the None
+            # branch above) and would corrupt the floor; only real batch steps
+            # count.
+            elapsed = now - self._auto_first_completion_ts
+            if _AUTO_QUANTA_SKIP_S <= elapsed < _AUTO_QUANTA_SKIP_S + _AUTO_QUANTA_WINDOW_S:
+                self._auto_min_step_dt = (
+                    self._step_dt
+                    if self._auto_min_step_dt is None
+                    else min(self._auto_min_step_dt, self._step_dt)
+                )
         self._accrue_wait_and_promote()
         preempted_req_ids = self._proactively_preempt(now)
         self._policy_timer.record(time.perf_counter() - entered)
@@ -565,11 +607,16 @@ class QuantumMlfqMixin:
         Runs only under ``AUTELLIX_AUTO_QUANTA``. The first
         ``_AUTO_QUANTA_SKIP_S`` seconds of completions are discarded as startup
         transient, the next ``_AUTO_QUANTA_WINDOW_S`` seconds are sampled, and Q1
-        is then set to the ``_AUTO_QUANTA_QUANTILE`` quantile of that window with
-        the rest of the ladder doubling from there; calibration then stops for
-        the life of the engine. If the window yields fewer than
+        is then set from that window -- by default the ``_AUTO_QUANTA_QUANTILE``
+        quantile of completed-call service; under ``_AUTO_QUANTA_ANCHOR_ENV=
+        min_step`` instead the minimum ``schedule()`` step duration observed in
+        the same window (tracked in ``schedule()``, not here). The rest of the
+        ladder doubles from Q1 either way; calibration then stops for the life
+        of the engine. If the window yields fewer than
         ``_AUTO_QUANTA_MIN_SAMPLES`` completions the configured ladder is kept
-        rather than fitted to noise.
+        rather than fitted to noise -- this gate is on completed-call count for
+        both anchors, since steps are far more frequent than completions and
+        clearing it implies enough steps were also observed.
 
         Calls already in flight keep the quantum they were issued, so the switch
         cannot retroactively demote anything; only calls registered afterwards
@@ -600,17 +647,25 @@ class QuantumMlfqMixin:
             return
 
         ordered = sorted(self._auto_samples)
-        idx = min(int(_AUTO_QUANTA_QUANTILE * len(ordered)), len(ordered) - 1)
-        base = max(ordered[idx], _MIN_QUANTUM_S)
+        if self._auto_anchor == _AUTO_QUANTA_ANCHOR_MIN_STEP:
+            # FastServe's own anchor (see _AUTO_QUANTA_ANCHOR_ENV above): the
+            # floor of what one scheduled step actually cost in this window,
+            # not a quantile of completed-call service.
+            base = max(self._auto_min_step_dt or _MIN_QUANTUM_S, _MIN_QUANTUM_S)
+            anchor_label = "min_step"
+        else:
+            idx = min(int(_AUTO_QUANTA_QUANTILE * len(ordered)), len(ordered) - 1)
+            base = max(ordered[idx], _MIN_QUANTUM_S)
+            anchor_label = "p%d" % int(_AUTO_QUANTA_QUANTILE * 100)
         self.queue_quanta = tuple(base * (2**i) for i in range(self.num_queues))
         self._service_ladder = tuple(self.queue_quanta)
         self.completed_service_hist = [0] * (len(self._service_ladder) + 1)
         self._auto_calibrated = True
         self._auto_samples.clear()
         logger.info(
-            "autellix_auto_quanta calibrated: p%d=%.4fs over %d calls in a "
+            "autellix_auto_quanta calibrated: anchor=%s base=%.4fs over %d calls in a "
             "%.0fs window (after %.0fs skip) -> ladder=%s",
-            int(_AUTO_QUANTA_QUANTILE * 100),
+            anchor_label,
             base,
             len(ordered),
             _AUTO_QUANTA_WINDOW_S,
