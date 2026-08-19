@@ -240,15 +240,6 @@ class SchedulerOutput:
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
 
-    # Swap-based preemption (preemption_mode="swap"): lists of
-    # (gpu_block_id, host_block_id) pairs. swap_out copies GPU->host as a request
-    # is parked; swap_in copies host->GPU as it resumes. The worker runs these in
-    # _update_states via copy_kv_blocks: swap_in *before* attention reads the KV,
-    # swap_out *after* the request's last write has fenced. Decoder-only /
-    # single KV-cache group only (guarded at startup).
-    blocks_to_swap_out: list[tuple[int, int]] | None = None
-    blocks_to_swap_in: list[tuple[int, int]] | None = None
-
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0

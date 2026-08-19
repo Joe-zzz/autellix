@@ -20,7 +20,6 @@ logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
 SchedulerPolicy = Literal["fcfs", "priority"]
-PreemptionMode = Literal["recompute", "swap"]
 
 
 @config
@@ -129,25 +128,6 @@ class SchedulerConfig:
     """The scheduler class to use. "vllm.v1.core.sched.scheduler.Scheduler" is
     the default scheduler. Can be a class directly or the path to a class of
     form "mod.custom_class"."""
-
-    preemption_mode: PreemptionMode = "recompute"
-    """How the scheduler reclaims KV cache when it preempts a running request
-    (either under KV-cache pressure or via a program-aware policy's proactive
-    preemption):
-
-    - "recompute" (default): free the request's KV blocks and re-prefill its
-      prompt+generated tokens on resume. This is vLLM V1's only built-in mode.
-    - "swap": copy the request's KV blocks to a pinned host buffer, free the GPU
-      blocks, and copy them back on resume *without* re-prefill (restores the
-      V0-style swap preemption used by the Autellix paper). Research-grade:
-      requires ``tensor_parallel_size == 1`` and a decoder-only model, and falls
-      back to recompute per-request when the host swap pool is full."""
-
-    swap_space_gb: float = Field(default=4.0, ge=0.0)
-    """Host memory (GiB) reserved *per engine* for the swap-preemption pool when
-    ``preemption_mode == "swap"``. Sized for the expected preempted set, not the
-    whole GPU; when it is exhausted, preemption falls back to recompute. Ignored
-    when ``preemption_mode == "recompute"``."""
 
     disable_hybrid_kv_cache_manager: bool | None = None
     """If set to True, KV cache manager will allocate the same size of KV cache

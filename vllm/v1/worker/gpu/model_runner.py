@@ -47,10 +47,7 @@ from vllm.tasks import SupportedTask
 from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import PIN_MEMORY, STR_DTYPE_TO_TORCH_DTYPE
-from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.core.swap_pool import num_host_blocks_for
-from vllm.v1.metrics.phase_timing import PhaseTimer
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
@@ -495,95 +492,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.vllm_config,
         )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
-        self._init_swap_host_mirror(kv_caches_dict, self.kv_cache_config)
-
-    def _init_swap_host_mirror(
-        self, kv_caches: dict[str, torch.Tensor], kv_cache_config: KVCacheConfig
-    ) -> None:
-        """Allocate the pinned host KV mirror used by swap-based preemption.
-
-        Mirrors the V1 runner so both runners agree on host block ids: the pool
-        size is derived from ``kv_cache_config`` rather than the tensors,
-        because the scheduler -- which has no tensors -- derives the same number
-        and indexes into it with the swap descriptors it emits. Left empty in
-        recompute mode.
-        """
-        self._swap_gpu_kv_caches: dict[str, torch.Tensor] = {}
-        self.host_kv_caches: dict[str, torch.Tensor] = {}
-        # Small window: a silent timer is ambiguous between "never fired" and
-        # "fired fewer times than the window".
-        self._swap_timers = {
-            "d2h": PhaseTimer("swap_out_d2h", emit_every=20),
-            "h2d": PhaseTimer("swap_in_h2d", emit_every=20),
-        }
-        if self.scheduler_config.preemption_mode != "swap" or not kv_caches:
-            return
-
-        kv_bytes_per_block = sum(
-            g.kv_cache_spec.page_size_bytes for g in kv_cache_config.kv_cache_groups
-        )
-        num_host_blocks = min(
-            num_host_blocks_for(
-                self.scheduler_config.swap_space_gb, kv_bytes_per_block
-            ),
-            kv_cache_config.num_blocks,
-        )
-        if num_host_blocks <= 0:
-            return
-
-        self._swap_gpu_kv_caches = kv_caches
-        self.host_kv_caches = {
-            name: torch.empty(
-                (num_host_blocks, *t.shape[1:]),
-                dtype=t.dtype,
-                device="cpu",
-                pin_memory=True,
-            )
-            for name, t in kv_caches.items()
-        }
-        logger.info(
-            "Swap preemption (v2 runner): host KV pool = %d blocks (%.2f GiB), "
-            "mirroring %d GPU blocks.",
-            num_host_blocks,
-            num_host_blocks * kv_bytes_per_block / (1024**3),
-            kv_cache_config.num_blocks,
-        )
-
-    def _swap_kv_blocks(self, pairs: list[tuple[int, int]], direction: str) -> None:
-        """Copy KV blocks between GPU and the pinned host swap mirror.
-
-        Args:
-            pairs: ``(gpu_block_id, host_block_id)`` pairs.
-            direction: ``"d2h"`` to swap out (GPU->host) or ``"h2d"`` to swap in
-                (host->GPU).
-        """
-        if not self.host_kv_caches or not pairs:
-            return
-        gpu_ids = [g for g, _ in pairs]
-        host_ids = [h for _, h in pairs]
-        started = time.perf_counter()
-        if direction == "d2h":
-            copy_kv_blocks(
-                self._swap_gpu_kv_caches,
-                self.host_kv_caches,
-                gpu_ids,
-                host_ids,
-                "d2h",
-            )
-        else:
-            copy_kv_blocks(
-                self.host_kv_caches,
-                self._swap_gpu_kv_caches,
-                host_ids,
-                gpu_ids,
-                "h2d",
-            )
-        timer = self._swap_timers.get(direction)
-        if timer is not None:
-            timer.record(time.perf_counter() - started, weight=len(pairs))
-            if timer.should_emit():
-                logger.info("swap_timing %s %s", timer.name, timer.summary())
-                timer.reset()
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
@@ -927,22 +835,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             out=self.req_states.num_computed_prefill_tokens,
         )
 
-        # Swap-based preemption. Ordering matters and mirrors the V1 runner:
-        # swap-OUT must read the original KV BEFORE those (now-freed, possibly
-        # reallocated) blocks are zeroed or overwritten; then zero freshly
-        # allocated blocks; then swap-IN restores parked KV into them before
-        # attention reads it.
-        if scheduler_output.blocks_to_swap_out:
-            self._swap_kv_blocks(scheduler_output.blocks_to_swap_out, "d2h")
-
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
             assert self.kv_block_zeroer is not None
             self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
-
-        if scheduler_output.blocks_to_swap_in:
-            self._swap_kv_blocks(scheduler_output.blocks_to_swap_in, "h2d")
 
     def prepare_inputs(
         self, scheduler_output: SchedulerOutput, batch_desc: BatchExecutionDescriptor
