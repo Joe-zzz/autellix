@@ -102,8 +102,10 @@ _AUTO_QUANTA_MIN_SAMPLES = 50
 # (8B PRM), ~2 s (1B generation) and ~16-32 s (RAG), and ladders starting near a
 # quarter of those put every engine into a healthy spread, where both a ladder
 # 3x too high (zero demotions, MLFQ inert) and one 20x too low (calls sink to the
-# bottom level immediately) had failed.
-_AUTO_QUANTA_QUANTILE = 0.25
+# bottom level immediately) had failed. Overridable for a direct A/B against the
+# default (e.g. AUTELLIX_AUTO_QUANTA_QUANTILE=0.10 for p10) -- inert unless set,
+# so every config that predates this behaves identically.
+_AUTO_QUANTA_QUANTILE = float(os.getenv("AUTELLIX_AUTO_QUANTA_QUANTILE", "0.25"))
 _MIN_QUANTUM_S = 1e-3
 
 # Alternative Q1 anchor: the minimum observed schedule() step duration in the
