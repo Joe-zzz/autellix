@@ -96,7 +96,22 @@ _AUTO_QUANTA_SKIP_S = float(os.getenv("AUTELLIX_AUTO_QUANTA_SKIP_S", "60"))
 _AUTO_QUANTA_WINDOW_S = float(os.getenv("AUTELLIX_AUTO_QUANTA_WINDOW_S", "60"))
 # Floor on samples before trusting the quantile, in case an engine is slow enough
 # that the window yields very few completions.
-_AUTO_QUANTA_MIN_SAMPLES = 50
+#
+# Overridable because the right floor depends on how fast the workload completes
+# calls, and 50 assumes a window that sees hundreds. A workload of minutes-long
+# agentic programs at fractional-request-per-second arrival can put only single
+# digits through a 60 s window, so the default would silently keep the
+# unconfigured ladder there forever -- calibration never fires, and the engine
+# runs on quanta chosen for a different workload. Lower it (together with a
+# longer AUTELLIX_AUTO_QUANTA_WINDOW_S) for such engines, and note the
+# variance cost: resampling a measured coding-agent service distribution, the
+# p25 estimate's 80% interval widens from [2.84, 3.17] s at n=50 to
+# [2.37, 3.28] at n=22 and [2.05, 3.59] at n=8, so a floor far below the
+# window's actual yield buys nothing and only fits noise.
+#
+# Inert unless set: every config that predates this keeps the 50 it was
+# measured with.
+_AUTO_QUANTA_MIN_SAMPLES = int(os.getenv("AUTELLIX_AUTO_QUANTA_MIN_SAMPLES", "50"))
 # Q1 lands at this quantile of observed call service, and the ladder doubles from
 # there. Calibrated by hand first: the engines' typical calls measured ~0.3 s
 # (8B PRM), ~2 s (1B generation) and ~16-32 s (RAG), and ladders starting near a
